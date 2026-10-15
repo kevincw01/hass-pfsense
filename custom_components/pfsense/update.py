@@ -137,7 +137,10 @@ class PfSenseFirmwareUpdatesAvailableUpdate(PfSenseUpdate):
     @property
     def extra_state_attributes(self):
         state = self.coordinator.data
-        attrs = {}
+        attrs = {
+            f"firmware_poll_{key}": value
+            for key, value in state.get("firmware_poll_health", {}).items()
+        }
         info = dict_get(state, "firmware_update_info.base", {})
 
         if info == False:

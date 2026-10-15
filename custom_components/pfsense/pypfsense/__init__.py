@@ -14,8 +14,30 @@ import xmlrpc.client
 
 # value to set as the socket timeout
 DEFAULT_TIMEOUT = 10
+FIRMWARE_TIMEOUT = 60
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class _RequestTimeoutMixin:
+    """Set a timeout on this connection, never on unrelated sockets."""
+
+    def __init__(self, timeout, **kwargs):
+        self._request_timeout = timeout
+        super().__init__(**kwargs)
+
+    def make_connection(self, host):
+        connection = super().make_connection(host)
+        connection.timeout = self._request_timeout
+        return connection
+
+
+class _TimeoutTransport(_RequestTimeoutMixin, xmlrpc.client.Transport):
+    pass
+
+
+class _TimeoutSafeTransport(_RequestTimeoutMixin, xmlrpc.client.SafeTransport):
+    pass
 
 
 def dict_get(data: dict, path: str, default=None):
@@ -71,7 +93,7 @@ class Client(object):
         self._url_parts = urlparse(self._url)
 
     # https://stackoverflow.com/questions/64983392/python-multiple-patch-gives-http-client-cannotsendrequest-request-sent
-    def _get_proxy(self):
+    def _get_proxy(self, timeout=None):
         # https://docs.python.org/3/library/xmlrpc.client.html#module-xmlrpc.client
         # https://stackoverflow.com/questions/30461969/disable-default-certificate-verification-in-python-2-7-9
         context = None
@@ -85,7 +107,16 @@ class Client(object):
         # set to True if necessary during development
         verbose = False
 
-        proxy = xmlrpc.client.ServerProxy(self._url, context=context, verbose=verbose)
+        transport = None
+        if timeout is not None:
+            transport = (
+                _TimeoutSafeTransport(timeout, context=context)
+                if self._url_parts.scheme == "https"
+                else _TimeoutTransport(timeout)
+            )
+        proxy = xmlrpc.client.ServerProxy(
+            self._url, context=context, verbose=verbose, transport=transport
+        )
         return proxy
 
     def _apply_timeout(func):
@@ -142,7 +173,7 @@ $toreturn["real"] = json_encode($toreturn_real);
         response = json.loads(response["real"])
         return response
 
-    def _exec_php_no_timeout(self, script):
+    def _exec_php_no_timeout(self, script, timeout=None):
         script = """
 ini_set('display_errors', 0);
 
@@ -156,7 +187,7 @@ $toreturn["real"] = json_encode($toreturn_real);
 """.format(
             script
         )
-        response = self._get_proxy().pfsense.exec_php(script)
+        response = self._get_proxy(timeout=timeout).pfsense.exec_php(script)
         response = json.loads(response["real"])
         return response
 
@@ -210,7 +241,9 @@ $toreturn = [
     ]
 ];
 """
-        response = self._exec_php(script)
+        # Firmware repository checks can take longer than ordinary telemetry.
+        # Bypass the legacy global-timeout decorator; bound only this transport.
+        response = self._exec_php_no_timeout(script, timeout=FIRMWARE_TIMEOUT)
         return response["data"]
 
     @_log_errors

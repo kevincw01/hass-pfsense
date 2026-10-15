@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import copy
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 import math
 import re
+import threading
 import time
 from typing import Callable
 
@@ -218,6 +219,15 @@ class PfSenseData:
         self._hass = hass
         self._state = {}
         self._firmware_update_info = None
+        self._firmware_refresh_lock = threading.Lock()
+        self._firmware_state_lock = threading.Lock()
+        self._firmware_poll_health = {
+            "last_success_at": None,
+            "last_failure_at": None,
+            "last_failure_type": None,
+            "consecutive_failures": 0,
+            "in_progress": False,
+        }
         self._background_tasks = set()
 
     @property
@@ -242,19 +252,61 @@ class PfSenseData:
 
     @_log_timing
     def _refresh_firmware_update_info(self):
+        if not self._firmware_refresh_lock.acquire(blocking=False):
+            return
         try:
-            self._firmware_update_info = self._client.get_firmware_update_info()
-
-        except BaseException as err:
-            # can take some time to refresh data
-            # will catch it the next cycle likely
-            if "timed out" in str(err):
-                return
-            raise err
+            with self._firmware_state_lock:
+                self._firmware_poll_health["in_progress"] = True
+            info = self._client.get_firmware_update_info()
+            if (
+                not isinstance(info, dict)
+                or not isinstance(info.get("base"), dict)
+                or not info["base"]
+            ):
+                raise ValueError("Missing firmware result")
+            with self._firmware_state_lock:
+                failures = self._firmware_poll_health["consecutive_failures"]
+                first = self._firmware_poll_health["last_success_at"] is None
+                self._firmware_update_info = info
+                self._firmware_poll_health.update(
+                    last_success_at=datetime.now(timezone.utc).isoformat(),
+                    consecutive_failures=0,
+                )
+            if failures:
+                _LOGGER.warning(
+                    "pfSense firmware polling recovered after %s failed checks; firmware lookup succeeded",
+                    failures,
+                )
+            elif first:
+                _LOGGER.info(
+                    "pfSense firmware lookup succeeded (first success since initialization)"
+                )
+        except Exception as err:
+            with self._firmware_state_lock:
+                self._firmware_poll_health["last_failure_at"] = datetime.now(
+                    timezone.utc
+                ).isoformat()
+                self._firmware_poll_health["last_failure_type"] = type(err).__name__
+                self._firmware_poll_health["consecutive_failures"] += 1
+            _LOGGER.warning(
+                "pfSense firmware lookup failed (%s); retaining last successful result",
+                type(err).__name__,
+            )
+        finally:
+            with self._firmware_state_lock:
+                self._firmware_poll_health["in_progress"] = False
+            self._firmware_refresh_lock.release()
 
     @_log_timing
     def _get_firmware_update_info(self):
-        return self._firmware_update_info
+        with self._firmware_state_lock:
+            return copy.deepcopy(self._firmware_update_info)
+
+    def _get_firmware_poll_health(self):
+        with self._firmware_state_lock:
+            health = dict(self._firmware_poll_health)
+        health["observed_at"] = datetime.now(timezone.utc).isoformat()
+        return health
 
     @_log_timing
     def _get_telemetry(self):
@@ -334,6 +386,7 @@ class PfSenseData:
                 self._hass.add_job(self._refresh_firmware_update_info)
 
                 new_state["firmware_update_info"] = self._get_firmware_update_info()
+                new_state["firmware_poll_health"] = self._get_firmware_poll_health()
                 new_state["telemetry"] = self._get_telemetry()
                 new_state["config"] = self._get_config()
                 new_state["interfaces"] = self._get_interfaces()
